@@ -2716,7 +2716,7 @@ private:
     {
         if (auto* owner = getOwner (self))
             if (owner->sendDragCallback (&NSViewComponentPeer::handleDragMove, sender))
-                return NSDragOperationGeneric;
+                return NSDragOperationCopy;
 
         return NSDragOperationNone;
     }
