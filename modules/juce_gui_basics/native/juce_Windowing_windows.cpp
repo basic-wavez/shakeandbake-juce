@@ -1991,7 +1991,7 @@ public:
 
         JUCE_COMRESULT DragEnter (IDataObject* pDataObject, DWORD grfKeyState, POINTL mousePos, DWORD* pdwEffect) override
         {
-            auto hr = updateFileList (pDataObject);
+            auto hr = updateFileList (pDataObject, false);
 
             if (FAILED (hr))
                 return hr;
@@ -2021,7 +2021,7 @@ public:
 
         JUCE_COMRESULT Drop (IDataObject* pDataObject, DWORD /*grfKeyState*/, POINTL mousePos, DWORD* pdwEffect) override
         {
-            auto hr = updateFileList (pDataObject);
+            auto hr = updateFileList (pDataObject, true);
 
             if (FAILED (hr))
                 return hr;
@@ -2090,7 +2090,229 @@ public:
             }
         }
 
-        HRESULT updateFileList (IDataObject* const dataObject)
+        // SNB patch: hosts that render dragged audio at drop time (Reason, FL Studio,
+        // Studio One) offer "virtual files" (FileGroupDescriptor + FileContents)
+        // instead of CF_HDROP paths. During hover only the descriptor names are read
+        // (fetching contents would force the host to bounce mid-drag); the streams
+        // are materialised into the promised-drops scratch folder when dropped.
+        static CLIPFORMAT getFileGroupDescriptorWFormat()
+        {
+            static const auto format = (CLIPFORMAT) RegisterClipboardFormat (CFSTR_FILEDESCRIPTORW);
+            return format;
+        }
+
+        static CLIPFORMAT getFileGroupDescriptorAFormat()
+        {
+            static const auto format = (CLIPFORMAT) RegisterClipboardFormat (CFSTR_FILEDESCRIPTORA);
+            return format;
+        }
+
+        static CLIPFORMAT getFileContentsFormat()
+        {
+            static const auto format = (CLIPFORMAT) RegisterClipboardFormat (CFSTR_FILECONTENTS);
+            return format;
+        }
+
+        static File getVirtualFileDropScratchRoot()
+        {
+            // Matches the scratch folder used for promised file drops on macOS so
+            // application-level handling can treat both alike.
+            return File::getSpecialLocation (File::tempDirectory)
+                       .getChildFile ("JUCE Promised File Drops");
+        }
+
+        static StringArray getVirtualFileNames (IDataObject* const dataObject)
+        {
+            StringArray names;
+
+            {
+                DroppedData descriptorData (dataObject, getFileGroupDescriptorWFormat());
+
+                if (SUCCEEDED (descriptorData.error)
+                    && descriptorData.data != nullptr
+                    && descriptorData.dataSize >= sizeof (UINT))
+                {
+                    const auto* descriptor = static_cast<const FILEGROUPDESCRIPTORW*> (descriptorData.data);
+                    const auto maxItems = (descriptorData.dataSize - offsetof (FILEGROUPDESCRIPTORW, fgd))
+                                            / sizeof (FILEDESCRIPTORW);
+
+                    for (UINT i = 0; i < descriptor->cItems && (SIZE_T) i < maxItems; ++i)
+                        names.add (String (CharPointer_UTF16 (descriptor->fgd[i].cFileName)));
+
+                    return names;
+                }
+            }
+
+            DroppedData descriptorData (dataObject, getFileGroupDescriptorAFormat());
+
+            if (SUCCEEDED (descriptorData.error)
+                && descriptorData.data != nullptr
+                && descriptorData.dataSize >= sizeof (UINT))
+            {
+                const auto* descriptor = static_cast<const FILEGROUPDESCRIPTORA*> (descriptorData.data);
+                const auto maxItems = (descriptorData.dataSize - offsetof (FILEGROUPDESCRIPTORA, fgd))
+                                        / sizeof (FILEDESCRIPTORA);
+
+                for (UINT i = 0; i < descriptor->cItems && (SIZE_T) i < maxItems; ++i)
+                    names.add (String (descriptor->fgd[i].cFileName));
+            }
+
+            return names;
+        }
+
+        static File materialiseVirtualFile (IDataObject* const dataObject,
+                                            UINT index,
+                                            const String& name,
+                                            const File& destinationDirectory)
+        {
+            FORMATETC format = { getFileContentsFormat(), nullptr, DVASPECT_CONTENT,
+                                 (LONG) index, TYMED_ISTREAM | TYMED_HGLOBAL };
+            STGMEDIUM medium {};
+
+            if (FAILED (dataObject->GetData (&format, &medium)))
+                return {};
+
+            auto releaseMedium = [&medium] { ReleaseStgMedium (&medium); };
+
+            auto legalName = File::createLegalFileName (name.trim());
+
+            if (legalName.isEmpty())
+                legalName = "dropped_file";
+
+            const auto destination = destinationDirectory.getChildFile (legalName);
+
+            const auto writeSucceeded = [&]
+            {
+                destination.deleteFile();
+                FileOutputStream output (destination);
+
+                if (output.failedToOpen())
+                    return false;
+
+                if (medium.tymed == TYMED_ISTREAM && medium.pstm != nullptr)
+                {
+                    HeapBlock<char> buffer (65536);
+
+                    for (;;)
+                    {
+                        ULONG bytesRead = 0;
+                        const auto hr = medium.pstm->Read (buffer.getData(), 65536, &bytesRead);
+
+                        if (bytesRead > 0 && ! output.write (buffer.getData(), (size_t) bytesRead))
+                            return false;
+
+                        if (hr != S_OK || bytesRead == 0)
+                            break;
+                    }
+                }
+                else if (medium.tymed == TYMED_HGLOBAL && medium.hGlobal != nullptr)
+                {
+                    const auto size = GlobalSize (medium.hGlobal);
+                    auto* data = GlobalLock (medium.hGlobal);
+
+                    if (data == nullptr)
+                        return false;
+
+                    const auto wrote = size == 0 || output.write (data, size);
+                    GlobalUnlock (medium.hGlobal);
+
+                    if (! wrote)
+                        return false;
+                }
+                else
+                {
+                    return false;
+                }
+
+                output.flush();
+                return output.getStatus().wasOk();
+            }();
+
+            releaseMedium();
+
+            if (! writeSucceeded)
+            {
+                destination.deleteFile();
+                return {};
+            }
+
+            return destination;
+        }
+
+        bool updateFileListFromVirtualFiles (IDataObject* const dataObject, bool materialiseFiles)
+        {
+            const auto virtualNames = getVirtualFileNames (dataObject);
+
+            if (virtualNames.isEmpty())
+                return false;
+
+            if (! materialiseFiles)
+            {
+                // Hover: report the promised names as paths inside the scratch root so
+                // targets can decide interest from the file names without the host
+                // having to render anything yet.
+                const auto scratchRoot = getVirtualFileDropScratchRoot();
+
+                for (const auto& name : virtualNames)
+                {
+                    auto legalName = File::createLegalFileName (name.trim());
+
+                    if (legalName.isEmpty())
+                        legalName = "dropped_file";
+
+                    dragInfo.files.add (scratchRoot.getChildFile (legalName).getFullPathName());
+                }
+
+                return true;
+            }
+
+            auto destinationDirectory = getVirtualFileDropScratchRoot()
+                                            .getChildFile ("drop_" + String::toHexString (Random::getSystemRandom().nextInt64()));
+
+            if (! destinationDirectory.createDirectory())
+                return false;
+
+            for (int i = 0; i < virtualNames.size(); ++i)
+            {
+                const auto materialised = materialiseVirtualFile (dataObject, (UINT) i,
+                                                                  virtualNames[i],
+                                                                  destinationDirectory);
+
+                if (materialised != File {})
+                    dragInfo.files.add (materialised.getFullPathName());
+            }
+
+            return ! dragInfo.files.isEmpty();
+        }
+
+        static bool isFormatAdvertised (IDataObject* const dataObject, CLIPFORMAT formatToFind)
+        {
+            IEnumFORMATETC* enumerator = nullptr;
+
+            if (dataObject == nullptr
+                || FAILED (dataObject->EnumFormatEtc (DATADIR_GET, &enumerator))
+                || enumerator == nullptr)
+            {
+                return false;
+            }
+
+            auto found = false;
+            FORMATETC format {};
+
+            while (enumerator->Next (1, &format, nullptr) == S_OK)
+            {
+                if (format.cfFormat == formatToFind)
+                {
+                    found = true;
+                    break;
+                }
+            }
+
+            enumerator->Release();
+            return found;
+        }
+
+        HRESULT updateFileList (IDataObject* const dataObject, bool materialiseVirtualFiles)
         {
             if (peerIsDeleted)
                 return S_FALSE;
@@ -2105,6 +2327,22 @@ public:
                     parseFileList (static_cast<HDROP> (fileData.data));
                     return S_OK;
                 }
+            }
+
+            // SNB patch: see updateFileListFromVirtualFiles above.
+            if (updateFileListFromVirtualFiles (dataObject, materialiseVirtualFiles))
+                return S_OK;
+
+            // SNB patch: some hosts (Reason) advertise CF_HDROP but defer producing
+            // the file list until the drop actually happens, failing hover-time
+            // GetData calls. Accept the drag optimistically with a promised audio
+            // placeholder so drop targets can show interest; the real list is
+            // fetched by the GetData call above when the drop arrives.
+            if (! materialiseVirtualFiles && isFormatAdvertised (dataObject, CF_HDROP))
+            {
+                dragInfo.files.add (getVirtualFileDropScratchRoot()
+                                        .getChildFile ("promised_audio.wav").getFullPathName());
+                return S_OK;
             }
 
             DroppedData textData (dataObject, CF_UNICODETEXT);
