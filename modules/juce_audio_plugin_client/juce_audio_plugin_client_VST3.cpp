@@ -106,16 +106,6 @@ JUCE_BEGIN_NO_SANITIZE ("vptr")
  #endif
 #endif
 
-/*  When nonzero, process() converts MIDI input without allocating. SysEx is skipped before
-    conversion, and each callback converts at most this many terminating events (note-offs,
-    All Notes Off, All Sound Off) and this many other short events into storage reserved by
-    preparePlugin(), counting the MIDI-controller parameters first and then the event list.
-    Once a class is full, its remaining events are dropped. Zero keeps the unbounded conversion.
-*/
-#ifndef JUCE_VST3_MIDI_INPUT_CAPACITY
- #define JUCE_VST3_MIDI_INPUT_CAPACITY 0
-#endif
-
 #if JUCE_LINUX || JUCE_BSD
  #include <juce_events/native/juce_EventLoopInternal_linux.h>
  #include <unordered_map>
@@ -3678,31 +3668,16 @@ public:
         if (juceVST3EditController->getMidiControllerForParameter (id, channel, ctrlNumber))
         {
             if (ctrlNumber == Vst::kAfterTouch)
-                addMidiInputEvent (MidiMessage::channelPressureChange (channel,
-                                                                       jlimit (0, 127, (int) (value * 128.0))), offsetSamples);
+                midiBuffer.addEvent (MidiMessage::channelPressureChange (channel,
+                                                                         jlimit (0, 127, (int) (value * 128.0))), offsetSamples);
             else if (ctrlNumber == Vst::kPitchBend)
-                addMidiInputEvent (MidiMessage::pitchWheel (channel,
-                                                            jlimit (0, 0x3fff, (int) (value * 0x4000))), offsetSamples);
+                midiBuffer.addEvent (MidiMessage::pitchWheel (channel,
+                                                              jlimit (0, 0x3fff, (int) (value * 0x4000))), offsetSamples);
             else
-                addMidiInputEvent (MidiMessage::controllerEvent (channel,
-                                                                 jlimit (0, 127, ctrlNumber),
-                                                                 jlimit (0, 127, (int) (value * 128.0))), offsetSamples);
+                midiBuffer.addEvent (MidiMessage::controllerEvent (channel,
+                                                                   jlimit (0, 127, ctrlNumber),
+                                                                   jlimit (0, 127, (int) (value * 128.0))), offsetSamples);
         }
-    }
-
-    void addMidiInputEvent (const MidiMessage& message, int sampleOffset)
-    {
-       #if JUCE_VST3_MIDI_INPUT_CAPACITY > 0
-        // Terminating events have their own budget, so other input cannot crowd them out of this buffer.
-        auto& count = midiInputCounts[message.isNoteOff() || message.isAllNotesOff() || message.isAllSoundOff() ? 1 : 0];
-
-        if (count >= JUCE_VST3_MIDI_INPUT_CAPACITY)
-            return;
-
-        ++count;
-       #endif
-
-        midiBuffer.addEvent (message, sampleOffset);
     }
 
     tresult PLUGIN_API process (Vst::ProcessData& data) override
@@ -3731,32 +3706,13 @@ public:
         }
 
         midiBuffer.clear();
-       #if JUCE_VST3_MIDI_INPUT_CAPACITY > 0
-        midiInputCounts = {};
-       #endif
 
         if (data.inputParameterChanges != nullptr)
             processParameterChanges (*data.inputParameterChanges);
 
        #if JucePlugin_WantsMidiInput
         if (isMidiInputBusEnabled && data.inputEvents != nullptr)
-        {
-           #if JUCE_VST3_MIDI_INPUT_CAPACITY > 0
-            const auto numEvents = data.inputEvents->getEventCount();
-
-            for (Steinberg::int32 i = 0; i < numEvents; ++i)
-            {
-                Vst::Event e;
-
-                // Converting SysEx allocates, so it is skipped
-                if (data.inputEvents->getEvent (i, e) == kResultOk && e.type != Vst::Event::kDataEvent)
-                    if (const auto message = MidiEventList::toMidiMessage (e))
-                        addMidiInputEvent (*message, e.sampleOffset);
-            }
-           #else
             MidiEventList::toMidiBuffer (midiBuffer, *data.inputEvents);
-           #endif
-        }
        #endif
 
         if (detail::PluginUtilities::getHostType().isWavelab())
@@ -3942,12 +3898,7 @@ private:
         if (callPrepareToPlay == CallPrepareToPlay::yes)
             p.prepareToPlay (sampleRate, bufferSize);
 
-       #if JUCE_VST3_MIDI_INPUT_CAPACITY > 0
-        // Each converted event is at most 3 bytes, stored after a 32-bit time and a 16-bit size
-        midiBuffer.ensureSize (2 * JUCE_VST3_MIDI_INPUT_CAPACITY * (3 + sizeof (int32) + sizeof (uint16)));
-       #else
         midiBuffer.ensureSize (2048);
-       #endif
         midiBuffer.clear();
 
         bufferMapper.updateFromProcessor (p);
@@ -4023,9 +3974,6 @@ private:
     Vst::ProcessSetup processSetup;
 
     MidiBuffer midiBuffer;
-   #if JUCE_VST3_MIDI_INPUT_CAPACITY > 0
-    std::array<int, 2> midiInputCounts {}; // Other and terminating events converted this callback
-   #endif
     ClientBufferMapper bufferMapper;
 
     bool active = false;
