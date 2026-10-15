@@ -1505,6 +1505,7 @@ private:
         return MidiMessage::createSysExMessage (e.bytes + 1, (int) e.size - 2);
     }
 
+public:
     static Optional<MidiMessage> toMidiMessage (const Steinberg::Vst::Event& e)
     {
         switch (e.type)
@@ -1545,6 +1546,7 @@ private:
         return {};
     }
 
+private:
     //==============================================================================
     struct Vst3MidiControlEvent
     {
